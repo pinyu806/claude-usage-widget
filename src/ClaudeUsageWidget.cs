@@ -103,6 +103,7 @@ namespace ClaudeUsageWidget
         System.Windows.Forms.Timer timer;
         DisplayMode currentMode = DisplayMode.Auto;
         double currentOpacity = 1.0;
+        string planOverride = "";   // 自訂方案顯示文字（空＝用 credentials 的 subscriptionType）
         bool isHovered = false;
         const int smallWidth = 106;
         const int smallHeight = 46;
@@ -164,10 +165,25 @@ namespace ClaudeUsageWidget
                 mOpacity.DropDownItems.Add(item);
             }
 
+            var mPlan = new ToolStripMenuItem("方案顯示");
+            var mPlanAuto = new ToolStripMenuItem("自動 (依帳號)", null, (s, e) => SetPlan(""));
+            var mPlanPro = new ToolStripMenuItem("Pro", null, (s, e) => SetPlan("Pro"));
+            var mPlanMax5 = new ToolStripMenuItem("Max 5x", null, (s, e) => SetPlan("Max 5x"));
+            var mPlanMax20 = new ToolStripMenuItem("Max 20x", null, (s, e) => SetPlan("Max 20x"));
+            var mPlanTeam = new ToolStripMenuItem("Team", null, (s, e) => SetPlan("Team"));
+            var mPlanCustom = new ToolStripMenuItem("自訂…", null, (s, e) => SetPlanCustom());
+            mPlan.DropDownItems.Add(mPlanAuto);
+            mPlan.DropDownItems.Add(mPlanPro);
+            mPlan.DropDownItems.Add(mPlanMax5);
+            mPlan.DropDownItems.Add(mPlanMax20);
+            mPlan.DropDownItems.Add(mPlanTeam);
+            mPlan.DropDownItems.Add(mPlanCustom);
+
             menu.Items.Add(mSmall);
             menu.Items.Add(mLarge);
             menu.Items.Add(mAuto);
             menu.Items.Add(mOpacity);
+            menu.Items.Add(mPlan);
             menu.Items.Add("-");
             menu.Items.Add("關閉", null, (s, e) => Close());
             ContextMenuStrip = menu;
@@ -187,6 +203,13 @@ namespace ClaudeUsageWidget
                         item.Checked = Math.Abs((opVal / 100.0) - currentOpacity) < 0.05;
                     }
                 }
+
+                mPlanAuto.Checked = planOverride == "";
+                mPlanPro.Checked = planOverride == "Pro";
+                mPlanMax5.Checked = planOverride == "Max 5x";
+                mPlanMax20.Checked = planOverride == "Max 20x";
+                mPlanTeam.Checked = planOverride == "Team";
+                mPlanCustom.Checked = planOverride != "" && planOverride != "Pro" && planOverride != "Max 5x" && planOverride != "Max 20x" && planOverride != "Team";
             };
 
             MouseDown += (s, e) => { if (e.Button == MouseButtons.Left) { dragging = true; dragOff = e.Location; } };
@@ -535,6 +558,10 @@ namespace ClaudeUsageWidget
                             currentOpacity = op;
                         }
                     }
+                    if (lines.Length > 2)
+                    {
+                        planOverride = lines[2].Trim();
+                    }
                 }
             }
             catch { }
@@ -554,7 +581,8 @@ namespace ClaudeUsageWidget
                 string path = Path.Combine(dir, ".widget_mode.txt");
                 string[] lines = new string[] {
                     ((int)currentMode).ToString(),
-                    currentOpacity.ToString(CultureInfo.InvariantCulture)
+                    currentOpacity.ToString(CultureInfo.InvariantCulture),
+                    planOverride
                 };
                 File.WriteAllLines(path, lines);
             }
@@ -566,6 +594,38 @@ namespace ClaudeUsageWidget
             currentOpacity = op;
             Opacity = op;
             SaveConfig();
+        }
+
+        void SetPlan(string text)
+        {
+            planOverride = text == null ? "" : text;
+            SaveConfig();
+            Invalidate();
+        }
+
+        void SetPlanCustom()
+        {
+            string r = PromptText("自訂方案顯示文字（留空＝自動依帳號）", planOverride);
+            if (r != null) SetPlan(r);
+        }
+
+        static string PromptText(string caption, string current)
+        {
+            using (var f = new Form())
+            {
+                f.Text = caption;
+                f.FormBorderStyle = FormBorderStyle.FixedDialog;
+                f.StartPosition = FormStartPosition.CenterScreen;
+                f.ClientSize = new Size(300, 96);
+                f.MaximizeBox = false; f.MinimizeBox = false; f.ShowInTaskbar = false; f.TopMost = true;
+                var tb = new TextBox(); tb.Text = current == null ? "" : current;
+                tb.Left = 12; tb.Top = 14; tb.Width = 276;
+                var ok = new Button(); ok.Text = "確定"; ok.Width = 75; ok.Left = 132; ok.Top = 52; ok.DialogResult = DialogResult.OK;
+                var cancel = new Button(); cancel.Text = "取消"; cancel.Width = 75; cancel.Left = 213; cancel.Top = 52; cancel.DialogResult = DialogResult.Cancel;
+                f.Controls.Add(tb); f.Controls.Add(ok); f.Controls.Add(cancel);
+                f.AcceptButton = ok; f.CancelButton = cancel;
+                return f.ShowDialog() == DialogResult.OK ? tb.Text.Trim() : null;
+            }
         }
 
         void ApplySizeAndRegion()
@@ -720,11 +780,9 @@ namespace ClaudeUsageWidget
                 var hrSz = g.MeasureString(hr, fSub);
                 using (var bHr = new SolidBrush(sl ? C_WARN : C_SUB))
                     g.DrawString(hr, fSub, bHr, Width - 14 - hrSz.Width, 12);
-                if (sb2 != "")
-                {
-                    string s2 = sb2.ToUpper();
-                    g.DrawString(s2, fSub, bSub, 14, 26);
-                }
+                string planText = planOverride != "" ? planOverride : (sb2 != "" ? sb2.ToUpper() : "");
+                if (planText != "")
+                    g.DrawString(planText, fSub, bSub, 14, 26);
 
                 if (!hd)
                 {
