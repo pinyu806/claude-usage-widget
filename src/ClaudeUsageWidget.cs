@@ -15,14 +15,22 @@ namespace ClaudeUsageWidget
 {
     static class Program
     {
+        static Mutex singleInstance;
+
         [STAThread]
         static void Main()
         {
+            // 同機單例：避免開機自啟與手動雙開造成同帳號輪詢疊加 → 429
+            bool createdNew;
+            singleInstance = new Mutex(true, "ClaudeUsageWidget_SingleInstance", out createdNew);
+            if (!createdNew) return;
+
             // api.anthropic.com 需 TLS 1.2；只啟用 1.2，不向下相容 1.0/1.1（避免降級）
             try { ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; } catch { }
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new Widget());
+            GC.KeepAlive(singleInstance);
         }
     }
 
@@ -54,9 +62,16 @@ namespace ClaudeUsageWidget
         const string TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
         static readonly DateTime Epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
+        // 輪詢/節流參數（降低 429：成功後 5 分鐘才自動再打；右鍵「立即重新整理」可即時刷新）
+        const int tickMs = 30000;     // timer 心跳：每 30s 檢查一次（多數心跳會被下方節流擋掉、不打 API）
+        const int refreshSec = 300;   // 成功後 5 分鐘內不自動再打（穩定時的實際更新頻率）
+        const int minRetrySec = 20;   // 任何觸發的最短重試間隔（防養熱）
+        // 穩定時實際每 5 分鐘打一次；失敗/尚無資料時靠 30s 心跳快速重試（受 429 退避保護），避免首筆資料等太久
+
         // 保護「顯示用」共享狀態（背景緒寫、UI 緒讀）＋ fetch reentrancy
         readonly object stateLock = new object();
         bool fetching = false;
+        bool fetchManual = false;
 
         Stat five = new Stat(), seven = new Stat();
         string sub = "";
@@ -109,7 +124,7 @@ namespace ClaudeUsageWidget
             Region = RoundRegion(Width, Height, isSmall ? 10 : 14);
 
             var menu = new ContextMenuStrip();
-            menu.Items.Add("立即重新整理", null, (s, e) => Refresh2());
+            menu.Items.Add("立即重新整理", null, (s, e) => Refresh2(true));
             menu.Items.Add("-");
 
             var mSmall = new ToolStripMenuItem("小面板", null, (s, e) => SetMode(DisplayMode.Small));
@@ -155,13 +170,13 @@ namespace ClaudeUsageWidget
             MouseMove += (s, e) => { if (dragging) Location = new Point(Location.X + e.X - dragOff.X, Location.Y + e.Y - dragOff.Y); };
             MouseUp += (s, e) => dragging = false;
 
-            timer = new System.Windows.Forms.Timer(); timer.Interval = 60000; timer.Tick += (s, e) => Refresh2();
+            timer = new System.Windows.Forms.Timer(); timer.Interval = tickMs; timer.Tick += (s, e) => Refresh2(false);
             timer.Start();
 
             hoverTimer = new System.Windows.Forms.Timer(); hoverTimer.Interval = 100; hoverTimer.Tick += HoverTimer_Tick;
             hoverTimer.Start();
 
-            Refresh2();
+            Refresh2(false);
         }
 
         static Region RoundRegion(int w, int h, int r)
@@ -176,27 +191,31 @@ namespace ClaudeUsageWidget
         }
 
         // 單一 fetch 在途：避免多執行緒同時讀寫憑證 / 競爭刷新
-        void Refresh2()
+        // manual=true（右鍵立即重新整理）會略過「成功快取窗」，但仍守最短重試與 429 退避
+        void Refresh2(bool manual)
         {
             lock (stateLock)
             {
                 if (fetching) return;
                 fetching = true;
+                fetchManual = manual;
             }
             var t = new Thread(Fetch); t.IsBackground = true; t.Start();
         }
 
         void Fetch()
         {
+            bool manual;
+            lock (stateLock) { manual = fetchManual; }
             try
             {
                 DateTime now = DateTime.UtcNow;
                 // 429 退避：冷卻期內不打 usage（仍重繪倒數）
                 if (haveData && now < nextAllowedUtc) { Invoke2(); return; }
-                // 成功快取 60s
-                if (haveData && (now - lastOkUtc).TotalSeconds < 60 && !stale && backoffSec == 0) { Invoke2(); return; }
-                // 最短重試間隔 20s（防養熱）
-                if (haveData && (now - lastTryUtc).TotalSeconds < 20) { Invoke2(); return; }
+                // 成功後更新窗：自動觸發時距上次成功不到 refreshSec 則沿用快取（手動刷新略過此窗）
+                if (!manual && haveData && (now - lastOkUtc).TotalSeconds < refreshSec && !stale && backoffSec == 0) { Invoke2(); return; }
+                // 最短重試間隔（防養熱）：任何觸發都守
+                if (haveData && (now - lastTryUtc).TotalSeconds < minRetrySec) { Invoke2(); return; }
                 lastTryUtc = now;
                 try
                 {
