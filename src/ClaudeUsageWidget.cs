@@ -6,6 +6,7 @@ using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Text;
+using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Web.Script.Serialization;
@@ -17,13 +18,26 @@ namespace ClaudeUsageWidget
     {
         static Mutex singleInstance;
 
+        [DllImport("user32.dll")] static extern int RegisterWindowMessage(string msg);
+        [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindow(string cls, string win);
+        // 第二實例靠此訊息把既有 widget 召回右下角（取代靜默退出）
+        public static readonly uint WM_SHOW = (uint)RegisterWindowMessage("ClaudeUsageWidget_ShowExisting_v1");
+
         [STAThread]
         static void Main()
         {
             // 同機單例：避免開機自啟與手動雙開造成同帳號輪詢疊加 → 429
             bool createdNew;
             singleInstance = new Mutex(true, "ClaudeUsageWidget_SingleInstance", out createdNew);
-            if (!createdNew) return;
+            if (!createdNew)
+            {
+                // 已有實例在跑：定向通知它現身（移回右下角），自己退出，而非靜默
+                // 註：HWND_BROADCAST 送不到 ShowInTaskbar=false 的工具視窗，故用 FindWindow 定向
+                IntPtr ex = FindWindow(null, "Claude 用量");
+                if (ex != IntPtr.Zero && WM_SHOW != 0) PostMessage(ex, WM_SHOW, IntPtr.Zero, IntPtr.Zero);
+                return;
+            }
 
             // api.anthropic.com 需 TLS 1.2；只啟用 1.2，不向下相容 1.0/1.1（避免降級）
             try { ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; } catch { }
@@ -95,6 +109,15 @@ namespace ClaudeUsageWidget
         const int largeWidth = 260;
         const int largeHeight = 172;
         System.Windows.Forms.Timer hoverTimer;
+
+        // 重用的字型（建立一次，避免每次 OnPaint new Font 造成 GDI 物件累積）
+        readonly Font fHead = new Font("Segoe UI", 8.5f, FontStyle.Bold);
+        readonly Font fSub = new Font("Segoe UI", 7.5f);
+        readonly Font fBig = new Font("Segoe UI", 19f, FontStyle.Bold);
+        readonly Font fLabel = new Font("Segoe UI", 8f, FontStyle.Bold);
+        readonly Font fTiny = new Font("Segoe UI", 7f);
+        readonly Font fPercent = new Font("Segoe UI", 9.5f, FontStyle.Bold);
+        readonly Font fTime = new Font("Segoe UI", 8.0f);
 
         public Widget()
         {
@@ -457,9 +480,14 @@ namespace ClaudeUsageWidget
             string ra = GetStr(seg, "resets_at");
             if (!string.IsNullOrEmpty(ra))
             {
-                DateTimeOffset r = DateTimeOffset.Parse(ra, CultureInfo.InvariantCulture);
-                st.RemainMin = Math.Max(0, (int)Math.Round((r.UtcDateTime - DateTime.UtcNow).TotalMinutes));
-                st.Reset = r.LocalDateTime.ToString("MM/dd HH:mm");
+                // 單獨容錯：resets_at 格式異常時保留已解析的百分比，僅倒數留預設，不毀整次 fetch
+                try
+                {
+                    DateTimeOffset r = DateTimeOffset.Parse(ra, CultureInfo.InvariantCulture);
+                    st.RemainMin = Math.Max(0, (int)Math.Round((r.UtcDateTime - DateTime.UtcNow).TotalMinutes));
+                    st.Reset = r.LocalDateTime.ToString("MM/dd HH:mm");
+                }
+                catch { }
             }
             return st;
         }
@@ -615,11 +643,7 @@ namespace ClaudeUsageWidget
 
         void DrawSmallPanel(Graphics g, bool hd, string statusText, Stat f, Stat s)
         {
-            using (var fPercent = new Font("Segoe UI", 9.5f, FontStyle.Bold))
-            using (var fTime = new Font("Segoe UI", 8.0f))
-            using (var fStatus = new Font("Segoe UI", 7.5f))
             using (var bTxt = new SolidBrush(C_TXT))
-            using (var bSub = new SolidBrush(C_SUB))
             {
                 if (!hd)
                 {
@@ -629,7 +653,7 @@ namespace ClaudeUsageWidget
                         sf.Alignment = StringAlignment.Center;
                         sf.LineAlignment = StringAlignment.Center;
                         using (var bw = new SolidBrush(C_WARN))
-                            g.DrawString(statusText, fStatus, bw, rect, sf);
+                            g.DrawString(statusText, fSub, bw, rect, sf);
                     }
                     return;
                 }
@@ -686,12 +710,6 @@ namespace ClaudeUsageWidget
                 DrawSmallPanel(g, hd, st, f, s);
                 return;
             }
-
-            var fHead = new Font("Segoe UI", 8.5f, FontStyle.Bold);
-            var fSub = new Font("Segoe UI", 7.5f);
-            var fBig = new Font("Segoe UI", 19f, FontStyle.Bold);
-            var fLabel = new Font("Segoe UI", 8f, FontStyle.Bold);
-            var fTiny = new Font("Segoe UI", 7f);
 
             using (var bTxt = new SolidBrush(C_TXT))
             using (var bSub = new SolidBrush(C_SUB))
@@ -756,6 +774,36 @@ namespace ClaudeUsageWidget
             p.AddArc(x, y + h - r, r, r, 90, 90);
             p.CloseFigure();
             g.FillPath(b, p);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            // 第二實例廣播：把走失/被蓋住的 widget 召回右下角現身
+            if (Program.WM_SHOW != 0 && m.Msg == (int)Program.WM_SHOW)
+            {
+                var wa = Screen.PrimaryScreen.WorkingArea;
+                Location = new Point(wa.Right - Width - 16, wa.Bottom - Height - 16);
+                TopMost = false; TopMost = true;
+                Invalidate();
+            }
+            base.WndProc(ref m);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (fHead != null) fHead.Dispose();
+                if (fSub != null) fSub.Dispose();
+                if (fBig != null) fBig.Dispose();
+                if (fLabel != null) fLabel.Dispose();
+                if (fTiny != null) fTiny.Dispose();
+                if (fPercent != null) fPercent.Dispose();
+                if (fTime != null) fTime.Dispose();
+                if (timer != null) timer.Dispose();
+                if (hoverTimer != null) hoverTimer.Dispose();
+            }
+            base.Dispose(disposing);
         }
     }
 }
