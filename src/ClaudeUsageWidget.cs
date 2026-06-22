@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Globalization;
@@ -7,6 +8,7 @@ using System.Net;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 namespace ClaudeUsageWidget
@@ -16,15 +18,15 @@ namespace ClaudeUsageWidget
         [STAThread]
         static void Main()
         {
-            // api.anthropic.com 需 TLS 1.2；.NET Framework 預設可能是 TLS 1.0 → 握手失敗
-            try { ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072 | (SecurityProtocolType)768 | SecurityProtocolType.Tls; } catch { }
+            // api.anthropic.com 需 TLS 1.2；只啟用 1.2，不向下相容 1.0/1.1（避免降級）
+            try { ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; } catch { }
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new Widget());
         }
     }
 
-    class Stat { public double Util = -1; public int RemainMin = 0; public string Reset = "--"; }
+    class Stat { public double Util = -1; public int RemainMin = 0; public string Reset = "--"; public bool Found = false; }
 
     enum DisplayMode
     {
@@ -51,6 +53,10 @@ namespace ClaudeUsageWidget
         const string CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
         const string TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
         static readonly DateTime Epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        // 保護「顯示用」共享狀態（背景緒寫、UI 緒讀）＋ fetch reentrancy
+        readonly object stateLock = new object();
+        bool fetching = false;
 
         Stat five = new Stat(), seven = new Stat();
         string sub = "";
@@ -169,76 +175,106 @@ namespace ClaudeUsageWidget
             return new Region(p);
         }
 
+        // 單一 fetch 在途：避免多執行緒同時讀寫憑證 / 競爭刷新
         void Refresh2()
         {
+            lock (stateLock)
+            {
+                if (fetching) return;
+                fetching = true;
+            }
             var t = new Thread(Fetch); t.IsBackground = true; t.Start();
         }
 
         void Fetch()
         {
-            DateTime now = DateTime.UtcNow;
-            // 429 退避：冷卻期內不打 usage（仍重繪倒數）
-            if (haveData && now < nextAllowedUtc) { Invoke2(); return; }
-            // 成功快取 60s
-            if (haveData && (now - lastOkUtc).TotalSeconds < 60 && !stale && backoffSec == 0) { Invoke2(); return; }
-            // 最短重試間隔 20s（防養熱）
-            if (haveData && (now - lastTryUtc).TotalSeconds < 20) { Invoke2(); return; }
-            lastTryUtc = now;
             try
             {
-                string cred = File.ReadAllText(credPath);
-                string tok = Match1(cred, "\"accessToken\"\\s*:\\s*\"([^\"]+)\"");
-                string rtok = Match1(cred, "\"refreshToken\"\\s*:\\s*\"([^\"]+)\"");
-                sub = Match1(cred, "\"subscriptionType\"\\s*:\\s*\"([^\"]+)\"");
-                string expS = Match1(cred, "\"expiresAt\"\\s*:\\s*([0-9]+)");
-                if (string.IsNullOrEmpty(tok)) { Fail("找不到 token"); return; }
-
-                // 到期前 60s 主動 refresh（避免直接吃 401）
-                long nowMs = (long)(DateTime.UtcNow - Epoch).TotalMilliseconds;
-                if (expS != "" && rtok != "")
+                DateTime now = DateTime.UtcNow;
+                // 429 退避：冷卻期內不打 usage（仍重繪倒數）
+                if (haveData && now < nextAllowedUtc) { Invoke2(); return; }
+                // 成功快取 60s
+                if (haveData && (now - lastOkUtc).TotalSeconds < 60 && !stale && backoffSec == 0) { Invoke2(); return; }
+                // 最短重試間隔 20s（防養熱）
+                if (haveData && (now - lastTryUtc).TotalSeconds < 20) { Invoke2(); return; }
+                lastTryUtc = now;
+                try
                 {
-                    long expMs;
-                    if (long.TryParse(expS, out expMs) && expMs - nowMs < 60000)
-                    {
-                        string nt = TryRefresh(rtok, now);
-                        if (nt != null) tok = nt;
-                    }
-                }
+                    object cred = ParseJson(File.ReadAllText(credPath));
+                    object oauth = GetVal(cred, "claudeAiOauth");
+                    string tok = GetStr(oauth, "accessToken");
+                    string rtok = GetStr(oauth, "refreshToken");
+                    string subType = GetStr(oauth, "subscriptionType");
+                    object expV = GetVal(oauth, "expiresAt");
+                    if (string.IsNullOrEmpty(tok)) { Fail("找不到 token"); return; }
 
-                string body = GetUsage(tok);
-                five = ParseStat(body, "five_hour");
-                seven = ParseStat(body, "seven_day");
-                haveData = true; stale = false; status = ""; lastOkUtc = DateTime.UtcNow;
-                backoffSec = 0; nextAllowedUtc = DateTime.MinValue;
-            }
-            catch (WebException we)
-            {
-                int code = StatusOf(we);
-                if (code == 429) { SetBackoff(we, now); Fail("限流(429)"); }
-                else if (code == 401 || code == 403)
-                {
-                    // token 過期 → 試 refresh 一次再重打 usage
-                    string rtok = Match1(SafeRead(credPath), "\"refreshToken\"\\s*:\\s*\"([^\"]+)\"");
-                    string nt = rtok != "" ? TryRefresh(rtok, now) : null;
-                    bool ok = false;
-                    if (nt != null)
+                    // 到期前 60s 主動 refresh（避免直接吃 401）
+                    long nowMs = (long)(DateTime.UtcNow - Epoch).TotalMilliseconds;
+                    if (expV != null && !string.IsNullOrEmpty(rtok))
                     {
-                        try
+                        long expMs = 0;
+                        try { expMs = Convert.ToInt64(expV); } catch { }
+                        if (expMs > 0 && expMs - nowMs < 60000)
                         {
-                            string body = GetUsage(nt);
-                            five = ParseStat(body, "five_hour"); seven = ParseStat(body, "seven_day");
-                            haveData = true; stale = false; status = ""; lastOkUtc = DateTime.UtcNow;
-                            backoffSec = 0; nextAllowedUtc = DateTime.MinValue;
-                            ok = true;
+                            string nt = TryRefresh(rtok, now);
+                            if (nt != null) tok = nt;
                         }
-                        catch { }
                     }
-                    if (!ok) Fail("請開 Claude Code 重新登入");
+
+                    object root = ParseJson(GetUsage(tok));
+                    Stat f = ParseStat(root, "five_hour");
+                    Stat s = ParseStat(root, "seven_day");
+                    if (!f.Found && !s.Found) { Fail("資料格式異常（API 可能已變更）"); return; }
+                    lock (stateLock)
+                    {
+                        five = f; seven = s; sub = subType == null ? "" : subType;
+                        haveData = true; stale = false; status = "";
+                        backoffSec = 0; nextAllowedUtc = DateTime.MinValue;
+                    }
+                    lastOkUtc = DateTime.UtcNow;
                 }
-                else Fail("連線失敗");
+                catch (WebException we)
+                {
+                    int code = StatusOf(we);
+                    if (code == 429) { SetBackoff(we, now); Fail("限流(429)"); }
+                    else if (code == 401 || code == 403)
+                    {
+                        // token 過期 → 試 refresh 一次再重打 usage
+                        string rtok = GetStr(GetVal(SafeParse(credPath), "claudeAiOauth"), "refreshToken");
+                        string nt = !string.IsNullOrEmpty(rtok) ? TryRefresh(rtok, now) : null;
+                        bool ok = false;
+                        if (nt != null)
+                        {
+                            try
+                            {
+                                object root = ParseJson(GetUsage(nt));
+                                Stat f = ParseStat(root, "five_hour");
+                                Stat s = ParseStat(root, "seven_day");
+                                if (f.Found || s.Found)
+                                {
+                                    lock (stateLock)
+                                    {
+                                        five = f; seven = s;
+                                        haveData = true; stale = false; status = "";
+                                        backoffSec = 0; nextAllowedUtc = DateTime.MinValue;
+                                    }
+                                    lastOkUtc = DateTime.UtcNow;
+                                    ok = true;
+                                }
+                            }
+                            catch { }
+                        }
+                        if (!ok) Fail("請開 Claude Code 重新登入");
+                    }
+                    else Fail("連線失敗");
+                }
+                catch (Exception ex) { Fail(ex.Message); }
+                Invoke2();
             }
-            catch (Exception ex) { Fail(ex.Message); }
-            Invoke2();
+            finally
+            {
+                lock (stateLock) { fetching = false; }
+            }
         }
 
         string GetUsage(string tok)
@@ -273,13 +309,17 @@ namespace ClaudeUsageWidget
                 using (var resp = (HttpWebResponse)req.GetResponse())
                 using (var sr = new StreamReader(resp.GetResponseStream()))
                     body = sr.ReadToEnd();
-                string na = Match1(body, "\"access_token\"\\s*:\\s*\"([^\"]+)\"");
-                if (na == "") { refreshNextUtc = now.AddSeconds(60); return null; }
-                string nr = Match1(body, "\"refresh_token\"\\s*:\\s*\"([^\"]+)\"");
-                string ei = Match1(body, "\"expires_in\"\\s*:\\s*([0-9]+)");
-                long newExp = 0; long sec;
-                if (ei != "" && long.TryParse(ei, out sec))
-                    newExp = (long)(DateTime.UtcNow - Epoch).TotalMilliseconds + sec * 1000L;
+                object r = ParseJson(body);
+                string na = GetStr(r, "access_token");
+                if (string.IsNullOrEmpty(na)) { refreshNextUtc = now.AddSeconds(60); return null; }
+                string nr = GetStr(r, "refresh_token");
+                object eiV = GetVal(r, "expires_in");
+                long newExp = 0;
+                if (eiV != null)
+                {
+                    try { newExp = (long)(DateTime.UtcNow - Epoch).TotalMilliseconds + Convert.ToInt64(eiV) * 1000L; }
+                    catch { }
+                }
                 WriteCreds(na, nr, newExp);
                 refreshNextUtc = DateTime.MinValue;
                 return na;
@@ -293,9 +333,10 @@ namespace ClaudeUsageWidget
             catch { refreshNextUtc = now.AddSeconds(60); return null; }
         }
 
-        // 只替換三個欄位值，保留其餘 JSON 結構；UTF-8 無 BOM
+        // 只替換三個欄位值，保留其餘 JSON 結構；UTF-8 無 BOM；原子置換避免寫一半毀憑證
         void WriteCreds(string access, string refresh, long expMs)
         {
+            string tmp = credPath + ".tmp";
             try
             {
                 string c = File.ReadAllText(credPath);
@@ -307,9 +348,15 @@ namespace ClaudeUsageWidget
                 if (expMs > 0)
                     c = Regex.Replace(c, "(\"expiresAt\"\\s*:\\s*)[0-9]+",
                                       m => m.Groups[1].Value + expMs.ToString());
-                File.WriteAllText(credPath, c, new UTF8Encoding(false));
+                File.WriteAllText(tmp, c, new UTF8Encoding(false));
+                // 同卷原子置換：避免行程中斷導致 .credentials.json 被截斷
+                if (File.Exists(credPath)) File.Replace(tmp, credPath, null);
+                else File.Move(tmp, credPath);
             }
-            catch { }
+            catch
+            {
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+            }
         }
 
         void SetBackoff(WebException we, DateTime now)
@@ -335,15 +382,18 @@ namespace ClaudeUsageWidget
             return hr != null ? (int)hr.StatusCode : 0;
         }
 
-        static string SafeRead(string p)
+        static object SafeParse(string p)
         {
-            try { return File.ReadAllText(p); } catch { return ""; }
+            try { return ParseJson(File.ReadAllText(p)); } catch { return null; }
         }
 
         void Fail(string msg)
         {
-            if (haveData) { stale = true; status = msg; }
-            else { status = msg; }
+            lock (stateLock)
+            {
+                if (haveData) { stale = true; status = msg; }
+                else { status = msg; }
+            }
             Invoke2();
         }
 
@@ -352,22 +402,41 @@ namespace ClaudeUsageWidget
             if (IsHandleCreated) { try { BeginInvoke((Action)(() => Invalidate())); } catch { } }
         }
 
-        static string Match1(string s, string pat)
+        // --- JSON helpers（用 JavaScriptSerializer 取代脆弱的 regex 解析）---
+        static object ParseJson(string s)
         {
-            var m = Regex.Match(s, pat);
-            return m.Success ? m.Groups[1].Value : "";
+            var ser = new JavaScriptSerializer();
+            ser.MaxJsonLength = int.MaxValue;
+            return ser.DeserializeObject(s);
         }
 
-        static Stat ParseStat(string json, string key)
+        static object GetVal(object o, string key)
+        {
+            var d = o as Dictionary<string, object>;
+            if (d == null) return null;
+            object v;
+            return d.TryGetValue(key, out v) ? v : null;
+        }
+
+        static string GetStr(object o, string key)
+        {
+            object v = GetVal(o, key);
+            return v == null ? null : v.ToString();
+        }
+
+        static Stat ParseStat(object root, string key)
         {
             var st = new Stat();
-            var m = Regex.Match(json, "\"" + key + "\"\\s*:\\s*\\{([^}]*)\\}");
-            if (!m.Success) return st;
-            string seg = m.Groups[1].Value;
-            string u = Match1(seg, "\"utilization\"\\s*:\\s*([0-9.]+)");
-            if (u != "") st.Util = double.Parse(u, CultureInfo.InvariantCulture);
-            string ra = Match1(seg, "\"resets_at\"\\s*:\\s*\"([^\"]+)\"");
-            if (ra != "")
+            object seg = GetVal(root, key);
+            if (seg == null) return st;
+            st.Found = true;
+            object u = GetVal(seg, "utilization");
+            if (u != null)
+            {
+                try { st.Util = Convert.ToDouble(u, CultureInfo.InvariantCulture); } catch { }
+            }
+            string ra = GetStr(seg, "resets_at");
+            if (!string.IsNullOrEmpty(ra))
             {
                 DateTimeOffset r = DateTimeOffset.Parse(ra, CultureInfo.InvariantCulture);
                 st.RemainMin = Math.Max(0, (int)Math.Round((r.UtcDateTime - DateTime.UtcNow).TotalMinutes));
@@ -525,7 +594,7 @@ namespace ClaudeUsageWidget
             }
         }
 
-        void DrawSmallPanel(Graphics g)
+        void DrawSmallPanel(Graphics g, bool hd, string statusText, Stat f, Stat s)
         {
             using (var fPercent = new Font("Segoe UI", 9.5f, FontStyle.Bold))
             using (var fTime = new Font("Segoe UI", 8.0f))
@@ -533,7 +602,7 @@ namespace ClaudeUsageWidget
             using (var bTxt = new SolidBrush(C_TXT))
             using (var bSub = new SolidBrush(C_SUB))
             {
-                if (!haveData)
+                if (!hd)
                 {
                     var rect = new RectangleF(6, (Height - 40) / 2.0f, Width - 12, 40);
                     using (var sf = new StringFormat())
@@ -541,7 +610,7 @@ namespace ClaudeUsageWidget
                         sf.Alignment = StringAlignment.Center;
                         sf.LineAlignment = StringAlignment.Center;
                         using (var bw = new SolidBrush(C_WARN))
-                            g.DrawString(status, fStatus, bw, rect, sf);
+                            g.DrawString(statusText, fStatus, bw, rect, sf);
                     }
                     return;
                 }
@@ -551,9 +620,9 @@ namespace ClaudeUsageWidget
                 float y2 = 23.0f;
 
                 // Draw Line 1 (5H)
-                double pct1 = five.Util < 0 ? 0 : five.Util;
+                double pct1 = f.Util < 0 ? 0 : f.Util;
                 string pct1Str = Math.Round(pct1) + "%";
-                string time1Str = RemTxt(five.RemainMin);
+                string time1Str = RemTxt(f.RemainMin);
 
                 var szPct1 = g.MeasureString(pct1Str, fPercent);
 
@@ -564,9 +633,9 @@ namespace ClaudeUsageWidget
                 }
 
                 // Draw Line 2 (7D)
-                double pct2 = seven.Util < 0 ? 0 : seven.Util;
+                double pct2 = s.Util < 0 ? 0 : s.Util;
                 string pct2Str = Math.Round(pct2) + "%";
-                string time2Str = RemTxt(seven.RemainMin);
+                string time2Str = RemTxt(s.RemainMin);
 
                 var szPct2 = g.MeasureString(pct2Str, fPercent);
 
@@ -585,13 +654,17 @@ namespace ClaudeUsageWidget
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
             g.Clear(C_BG);
 
-            Color borderCol = stale ? C_WARN : C_LINE;
+            // snapshot 共享狀態，避免與背景 fetch 緒 torn read
+            Stat f, s; string st, sb2; bool sl, hd;
+            lock (stateLock) { f = five; s = seven; st = status; sb2 = sub; sl = stale; hd = haveData; }
+
+            Color borderCol = sl ? C_WARN : C_LINE;
             using (var pen = new Pen(borderCol)) g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
 
             bool isSmall = (currentMode == DisplayMode.Small) || (currentMode == DisplayMode.Auto && !isHovered);
             if (isSmall)
             {
-                DrawSmallPanel(g);
+                DrawSmallPanel(g, hd, st, f, s);
                 return;
             }
 
@@ -606,29 +679,29 @@ namespace ClaudeUsageWidget
             {
                 // header
                 g.DrawString("CLAUDE 用量", fHead, bTxt, 14, 10);
-                string hr = stale ? "⏳ 快取" : (haveData ? DateTime.Now.ToString("HH:mm:ss") : "");
+                string hr = sl ? "⏳ 快取" : (hd ? DateTime.Now.ToString("HH:mm:ss") : "");
                 var hrSz = g.MeasureString(hr, fSub);
-                using (var bHr = new SolidBrush(stale ? C_WARN : C_SUB))
+                using (var bHr = new SolidBrush(sl ? C_WARN : C_SUB))
                     g.DrawString(hr, fSub, bHr, Width - 14 - hrSz.Width, 12);
-                if (sub != "")
+                if (sb2 != "")
                 {
-                    string s2 = sub.ToUpper();
+                    string s2 = sb2.ToUpper();
                     g.DrawString(s2, fSub, bSub, 14, 26);
                 }
 
-                if (!haveData)
+                if (!hd)
                 {
                     using (var bw = new SolidBrush(C_WARN))
-                        g.DrawString(status, fLabel, bw, 14, 70);
+                        g.DrawString(st, fLabel, bw, 14, 70);
                     return;
                 }
 
-                DrawRow(g, 44, "5H 視窗", five, bTxt, bSub, fLabel, fBig, fTiny);
-                DrawRow(g, 100, "7D 每週", seven, bTxt, bSub, fLabel, fBig, fTiny);
+                DrawRow(g, 44, "5H 視窗", f, bTxt, bSub, fLabel, fBig, fTiny);
+                DrawRow(g, 100, "7D 每週", s, bTxt, bSub, fLabel, fBig, fTiny);
 
-                if (stale && status != "")
+                if (sl && st != "")
                     using (var bw = new SolidBrush(C_WARN))
-                        g.DrawString("⚠ " + status, fTiny, bw, 14, 152);
+                        g.DrawString("⚠ " + st, fTiny, bw, 14, 152);
             }
         }
 

@@ -2,6 +2,18 @@
 
 桌面常駐小工具，即時顯示 Claude Code 官方用量額度（5 小時視窗 / 7 天每週），與 `/usage` 同一份數字。
 
+---
+
+## ⚠️ 免責聲明（請先閱讀）
+
+- **非官方工具**：本工具呼叫的 `GET /api/oauth/usage` 與 token refresh 端點皆為 **Anthropic 未公開、未承諾相容的內部端點**，並沿用 Claude Code 的公開 OAuth `client_id`。Anthropic 隨時可能變更或停用，屆時本工具會失效；也可能與服務條款有所牴觸，**請自行評估風險後使用**。
+- **會讀寫你的登入憑證**：本工具會讀取 `~/.claude/.credentials.json` 取得 OAuth token，並在 token 快過期時**改寫**該檔（更新 accessToken / refreshToken / expiresAt 三個欄位，採原子置換寫入）。所有處理皆在**本機**完成，**不上傳任何第三方**。
+- **不負擔保**：依 MIT 授權「按現狀」提供，使用後果自負（詳見 [LICENSE](LICENSE) 與 [SECURITY.md](SECURITY.md)）。
+
+> 建議自行檢視 [`src/ClaudeUsageWidget.cs`](src/ClaudeUsageWidget.cs) 原始碼後再使用，或自行編譯（見下方）。
+
+---
+
 ## 特色功能
 
 - **多種面板模式**：
@@ -19,11 +31,16 @@
 1. Windows 10 / 11（內建 .NET Framework 4.x，免安裝）
 2. 已安裝並登入 **Claude Code**（CLI），確保存在：
    `C:\Users\<你的帳號>\.claude\.credentials.json`
-   小工具會讀取此檔案中的 OAuth token 來呼叫 Anthropic 官方端點，**所有資料皆在本機處理，不會上傳至任何第三方**。
+   小工具會讀取此檔案中的 OAuth token 來呼叫 Anthropic 官方端點。
 
-## 使用說明
+## 取得與執行
 
-直接雙擊執行 `ClaudeUsageWidget.exe` 即可。
+本 repo **不再附帶預編譯的 `.exe`**（避免要求使用者執行無法驗證的二進位檔）。請二選一：
+
+- **A. 自行編譯**（推薦，最安心）：見下方「重新編譯」。
+- **B. 下載 Release**：至 [Releases](../../releases) 下載 `ClaudeUsageWidget.exe`，雙擊執行。
+
+> Release 的 exe 由本 repo 原始碼以下方指令編譯。若不放心，請改用 A 自行編譯比對。
 
 ### 右鍵選單功能
 在小工具上按滑鼠右鍵，可進行以下設定：
@@ -40,7 +57,7 @@
 
 ### 開機自動啟動
 
-- **啟用**：雙擊 `安裝開機自啟.cmd`，將在系統的「啟動」資料夾中建立小工具的捷徑。
+- **啟用**：雙擊 `安裝開機自啟.cmd`，將在系統的「啟動」資料夾中建立小工具的捷徑（指向同資料夾的 `ClaudeUsageWidget.exe`）。
 - **停用**：雙擊 `移除開機自啟.cmd`，或手動前往「啟動」資料夾刪除 `ClaudeUsage.lnk` 捷徑。
 
 ## 顯示說明（大面板）
@@ -51,13 +68,13 @@
 | 訂閱類型 | 顯示當前帳號類型（例如 PRO） |
 | 5H 視窗 | 5 小時滾動視窗使用率百分比、視覺化進度條、重置倒數與具體重置時間點 |
 | 7D 每週 | 7 天每週使用率百分比、視覺化進度條、重置倒數與具體重置時間點 |
-| 底部 ⚠ 字樣 | 當出現錯誤（如限流 429、Token 失效需重新登入等）時的異常提示 |
+| 底部 ⚠ 字樣 | 當出現錯誤（如限流 429、Token 失效需重新登入、資料格式異常等）時的異常提示 |
 
 ## 原理
 
-- **用量獲取**：發送 `GET https://api.anthropic.com/api/oauth/usage`（Header 帶 Bearer Access Token）。
-- **自動重新整理**：預設每 60 秒背景更新一次。
-- **Token 刷新**：當發現 `expiresAt` 即將到期（60 秒內）或 API 回傳 401/403 時，會發送 `POST https://console.anthropic.com/v1/oauth/token` 換取新 Token，並自動更新本機的 `.credentials.json`。
+- **用量獲取**：發送 `GET https://api.anthropic.com/api/oauth/usage`（Header 帶 Bearer Access Token）。回應以 JSON 反序列化解析（`five_hour` / `seven_day` 的 `utilization` 與 `resets_at`）。
+- **自動重新整理**：預設每 60 秒背景更新一次（同一時間只允許一個背景請求在途，避免並發競爭）。
+- **Token 刷新**：當發現 `expiresAt` 即將到期（60 秒內）或 API 回傳 401/403 時，會發送 `POST https://console.anthropic.com/v1/oauth/token` 換取新 Token，並以**原子置換**方式更新本機的 `.credentials.json`（只改三個欄位，保留其餘結構，UTF-8 無 BOM）。
 
 ## 疑難排解
 
@@ -66,7 +83,8 @@
 | 顯示「找不到 token」 | 尚未登入 Claude Code。請先在命令提示字元跑 `claude` 登入一次。 |
 | 顯示「請開 Claude Code 重新登入」 | Refresh Token 也已過期。請在終端機執行 `claude` 重新登入。 |
 | 顯示「限流(429)」 | 官方 API 端點暫時限制呼叫。小工具會自動進入冷卻退避時間，稍候會自行重試。 |
-| 小工具移出螢幕外或不見了 | 可手動刪除設定檔 `~/.claude/.widget_mode.txt` 以還原預設大小與位置，或重新執行 exe。 |
+| 顯示「資料格式異常」 | API 回應格式可能已變更（欄位改名等）。請至 Issues 回報。 |
+| 小工具移出螢幕外不見了 | 視窗位置不會被記住，**直接重新執行 exe** 即會回到右下角預設位置。 |
 
 ## 重新編譯（開發用）
 
@@ -76,7 +94,12 @@
 $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 & $csc /nologo /target:winexe /optimize+ /out:ClaudeUsageWidget.exe `
   /reference:System.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll `
+  /reference:System.Web.Extensions.dll `
   src\ClaudeUsageWidget.cs
 ```
 
 > ⚠️ **注意**：該編譯器為 C# 5.0，不可使用 C# 6.0 以上的新語法（例如字串插值 `$""`、空值條件運算子 `?.`、模式匹配 `is X y` 等）。
+
+## 授權
+
+[MIT](LICENSE)

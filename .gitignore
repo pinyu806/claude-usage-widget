@@ -1,3 +1,5 @@
 dirt/
 *.7z
 *.zip
+*.exe
+*.tmp
