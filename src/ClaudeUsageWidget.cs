@@ -64,7 +64,7 @@ namespace ClaudeUsageWidget
         static readonly Color C_BG = ColorTranslator.FromHtml("#181b22");
         static readonly Color C_LINE = ColorTranslator.FromHtml("#262b34");
         static readonly Color C_TXT = ColorTranslator.FromHtml("#e6e9ef");
-        static readonly Color C_SUB = ColorTranslator.FromHtml("#8b93a3");
+        static readonly Color C_SUB = ColorTranslator.FromHtml("#adb5c2");
         static readonly Color C_OK = ColorTranslator.FromHtml("#3fb950");
         static readonly Color C_WARN = ColorTranslator.FromHtml("#d29922");
         static readonly Color C_BAD = ColorTranslator.FromHtml("#f85149");
@@ -122,7 +122,7 @@ namespace ClaudeUsageWidget
         readonly Font fSub = new Font("Segoe UI", 7.5f);
         readonly Font fBig = new Font("Segoe UI", 19f, FontStyle.Bold);
         readonly Font fLabel = new Font("Segoe UI", 8f, FontStyle.Bold);
-        readonly Font fTiny = new Font("Segoe UI", 7f);
+        readonly Font fTiny = new Font("Segoe UI", 8.5f);  // reset/stale 行：7pt 對繁體中文太小會糊黏，放大
         readonly Font fPercent = new Font("Segoe UI", 9.5f, FontStyle.Bold);
         readonly Font fTime = new Font("Segoe UI", 8.0f);
 
