@@ -11,6 +11,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 namespace ClaudeUsageWidget
 {
@@ -78,8 +79,13 @@ namespace ClaudeUsageWidget
 
         // 輪詢/節流參數（降低 429：成功後 5 分鐘才自動再打；右鍵「立即重新整理」可即時刷新）
         const int tickMs = 30000;     // timer 心跳：每 30s 檢查一次（多數心跳會被下方節流擋掉、不打 API）
-        const int refreshSec = 300;   // 成功後 5 分鐘內不自動再打（穩定時的實際更新頻率）
+        int refreshSec = 300;         // 成功後幾秒內不自動再打（穩定時的實際更新頻率；可由選單調整）
         const int minRetrySec = 20;   // 任何觸發的最短重試間隔（防養熱）
+        const int alertPct = 90;      // 用量首次跨過此百分比時跳系統匣通知
+
+        // 開機自啟（寫 HKCU Run；選單版，取代外部 .cmd）
+        const string RUN_KEY = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+        const string RUN_NAME = "ClaudeUsageWidget";
         // 穩定時實際每 5 分鐘打一次；失敗/尚無資料時靠 30s 心跳快速重試（受 429 退避保護），避免首筆資料等太久
 
         // 保護「顯示用」共享狀態（背景緒寫、UI 緒讀）＋ fetch reentrancy
@@ -119,6 +125,9 @@ namespace ClaudeUsageWidget
         readonly Font fTiny = new Font("Segoe UI", 7f);
         readonly Font fPercent = new Font("Segoe UI", 9.5f, FontStyle.Bold);
         readonly Font fTime = new Font("Segoe UI", 8.0f);
+
+        NotifyIcon tray;
+        bool alerted5 = false, alerted7 = false;  // 通知去重：跨過閾值通知一次，回落後重置
 
         public Widget()
         {
@@ -179,11 +188,23 @@ namespace ClaudeUsageWidget
             mPlan.DropDownItems.Add(mPlanTeam);
             mPlan.DropDownItems.Add(mPlanCustom);
 
+            var mInterval = new ToolStripMenuItem("更新頻率");
+            var mInt1 = new ToolStripMenuItem("1 分鐘 (較易 429)", null, (s, e) => SetInterval(60));
+            var mInt5 = new ToolStripMenuItem("5 分鐘", null, (s, e) => SetInterval(300));
+            var mInt10 = new ToolStripMenuItem("10 分鐘", null, (s, e) => SetInterval(600));
+            mInterval.DropDownItems.Add(mInt1);
+            mInterval.DropDownItems.Add(mInt5);
+            mInterval.DropDownItems.Add(mInt10);
+
+            var mAutoStart = new ToolStripMenuItem("開機時啟動", null, (s, e) => ToggleAutoStart());
+
             menu.Items.Add(mSmall);
             menu.Items.Add(mLarge);
             menu.Items.Add(mAuto);
             menu.Items.Add(mOpacity);
             menu.Items.Add(mPlan);
+            menu.Items.Add(mInterval);
+            menu.Items.Add(mAutoStart);
             menu.Items.Add("-");
             menu.Items.Add("關閉", null, (s, e) => Close());
             ContextMenuStrip = menu;
@@ -210,6 +231,11 @@ namespace ClaudeUsageWidget
                 mPlanMax20.Checked = planOverride == "Max 20x";
                 mPlanTeam.Checked = planOverride == "Team";
                 mPlanCustom.Checked = planOverride != "" && planOverride != "Pro" && planOverride != "Max 5x" && planOverride != "Max 20x" && planOverride != "Team";
+
+                mInt1.Checked = refreshSec == 60;
+                mInt5.Checked = refreshSec == 300;
+                mInt10.Checked = refreshSec == 600;
+                mAutoStart.Checked = IsAutoStart();
             };
 
             MouseDown += (s, e) => { if (e.Button == MouseButtons.Left) { dragging = true; dragOff = e.Location; } };
@@ -221,6 +247,17 @@ namespace ClaudeUsageWidget
 
             hoverTimer = new System.Windows.Forms.Timer(); hoverTimer.Interval = 100; hoverTimer.Tick += HoverTimer_Tick;
             hoverTimer.Start();
+
+            // 系統匣圖示：供「接近上限」氣球通知；雙擊召回 widget；右鍵同選單
+            tray = new NotifyIcon();
+            tray.Icon = SystemIcons.Information;
+            tray.Text = "Claude 用量";
+            tray.Visible = true;
+            tray.ContextMenuStrip = menu;
+            tray.DoubleClick += (s, e) => ShowAtDefault();
+
+            // widget 本體雙擊 → 開官方用量頁
+            DoubleClick += (s, e) => OpenUsage();
 
             Refresh2(false);
         }
@@ -464,7 +501,7 @@ namespace ClaudeUsageWidget
 
         void Invoke2()
         {
-            if (IsHandleCreated) { try { BeginInvoke((Action)(() => Invalidate())); } catch { } }
+            if (IsHandleCreated) { try { BeginInvoke((Action)(() => { Invalidate(); CheckAlerts(); })); } catch { } }
         }
 
         // --- JSON helpers（用 JavaScriptSerializer 取代脆弱的 regex 解析）---
@@ -562,6 +599,14 @@ namespace ClaudeUsageWidget
                     {
                         planOverride = lines[2].Trim();
                     }
+                    if (lines.Length > 3)
+                    {
+                        int sec;
+                        if (int.TryParse(lines[3].Trim(), out sec) && sec >= 30 && sec <= 3600)
+                        {
+                            refreshSec = sec;
+                        }
+                    }
                 }
             }
             catch { }
@@ -582,7 +627,8 @@ namespace ClaudeUsageWidget
                 string[] lines = new string[] {
                     ((int)currentMode).ToString(),
                     currentOpacity.ToString(CultureInfo.InvariantCulture),
-                    planOverride
+                    planOverride,
+                    refreshSec.ToString()
                 };
                 File.WriteAllLines(path, lines);
             }
@@ -626,6 +672,74 @@ namespace ClaudeUsageWidget
                 f.AcceptButton = ok; f.CancelButton = cancel;
                 return f.ShowDialog() == DialogResult.OK ? tb.Text.Trim() : null;
             }
+        }
+
+        void SetInterval(int sec)
+        {
+            refreshSec = sec;
+            SaveConfig();
+        }
+
+        static bool IsAutoStart()
+        {
+            try { using (var k = Registry.CurrentUser.OpenSubKey(RUN_KEY, false)) return k != null && k.GetValue(RUN_NAME) != null; }
+            catch { return false; }
+        }
+
+        void ToggleAutoStart()
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(RUN_KEY, true))
+                {
+                    if (k == null) return;
+                    if (k.GetValue(RUN_NAME) != null) k.DeleteValue(RUN_NAME, false);
+                    else k.SetValue(RUN_NAME, "\"" + Application.ExecutablePath + "\"");
+                }
+            }
+            catch { }
+        }
+
+        void OpenUsage()
+        {
+            try { System.Diagnostics.Process.Start("https://claude.ai/settings/usage"); }
+            catch { }
+        }
+
+        void ShowAtDefault()
+        {
+            var wa = Screen.PrimaryScreen.WorkingArea;
+            Location = new Point(wa.Right - Width - 16, wa.Bottom - Height - 16);
+            TopMost = false; TopMost = true;
+            Invalidate();
+        }
+
+        // UI 緒：用量首次跨過閾值跳系統匣通知（回落後重置，下個週期可再通知）
+        void CheckAlerts()
+        {
+            double u5, u7; bool hd;
+            lock (stateLock) { u5 = five.Util; u7 = seven.Util; hd = haveData; }
+            if (!hd) return;
+            CheckOne(u5, ref alerted5, "5 小時視窗");
+            CheckOne(u7, ref alerted7, "7 天每週");
+        }
+
+        void CheckOne(double util, ref bool flag, string label)
+        {
+            if (util >= alertPct)
+            {
+                if (!flag)
+                {
+                    flag = true;
+                    if (tray != null)
+                    {
+                        tray.BalloonTipTitle = "Claude 用量警示";
+                        tray.BalloonTipText = label + " 用量已達 " + Math.Round(util) + "%";
+                        tray.ShowBalloonTip(5000);
+                    }
+                }
+            }
+            else flag = false;
         }
 
         void ApplySizeAndRegion()
@@ -838,12 +952,7 @@ namespace ClaudeUsageWidget
         {
             // 第二實例廣播：把走失/被蓋住的 widget 召回右下角現身
             if (Program.WM_SHOW != 0 && m.Msg == (int)Program.WM_SHOW)
-            {
-                var wa = Screen.PrimaryScreen.WorkingArea;
-                Location = new Point(wa.Right - Width - 16, wa.Bottom - Height - 16);
-                TopMost = false; TopMost = true;
-                Invalidate();
-            }
+                ShowAtDefault();
             base.WndProc(ref m);
         }
 
@@ -860,6 +969,7 @@ namespace ClaudeUsageWidget
                 if (fTime != null) fTime.Dispose();
                 if (timer != null) timer.Dispose();
                 if (hoverTimer != null) hoverTimer.Dispose();
+                if (tray != null) { tray.Visible = false; tray.Dispose(); }
             }
             base.Dispose(disposing);
         }
