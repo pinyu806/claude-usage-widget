@@ -868,7 +868,8 @@ namespace ClaudeUsageWidget
         {
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            // 深色背景 + 低對比灰字用 ClearType 次像素會出現彩邊(糊)；改灰階抗鋸齒較乾淨
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
             g.Clear(C_BG);
 
             // snapshot 共享狀態，避免與背景 fetch 緒 torn read
