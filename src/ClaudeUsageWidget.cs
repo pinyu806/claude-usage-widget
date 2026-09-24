@@ -566,6 +566,16 @@ namespace ClaudeUsageWidget
             return C_BAD;
         }
 
+        // 429 退避中的重試倒數（分鐘粒度，隨 30s 心跳重繪；不在退避中回空字串）
+        static string RetryTxt(DateTime nextUtc, bool compact)
+        {
+            double sec = (nextUtc - DateTime.UtcNow).TotalSeconds;
+            if (sec <= 0) return "";
+            if (sec < 60) return "即將重試";
+            int min = (int)Math.Ceiling(sec / 60.0);
+            return (compact ? "" : "約 ") + min + " 分後重試";
+        }
+
         static string RemTxt(int min)
         {
             int d = min / 1440;
@@ -891,12 +901,13 @@ namespace ClaudeUsageWidget
             }
         }
 
-        void DrawSmallPanel(Graphics g, bool hd, string statusText, Stat f, Stat s)
+        void DrawSmallPanel(Graphics g, bool hd, string statusText, string retry, Stat f, Stat s)
         {
             using (var bTxt = new SolidBrush(C_TXT))
             {
                 if (!hd)
                 {
+                    if (retry != "") statusText = statusText + "\n" + retry;
                     var rect = new RectangleF(6, (Height - 40) / 2.0f, Width - 12, 40);
                     using (var sf = new StringFormat())
                     {
@@ -949,8 +960,8 @@ namespace ClaudeUsageWidget
             g.Clear(C_BG);
 
             // snapshot 共享狀態，避免與背景 fetch 緒 torn read
-            Stat f, s; string st, sb2; bool sl, hd;
-            lock (stateLock) { f = five; s = seven; st = status; sb2 = sub; sl = stale; hd = haveData; }
+            Stat f, s; string st, sb2; bool sl, hd; DateTime na;
+            lock (stateLock) { f = five; s = seven; st = status; sb2 = sub; sl = stale; hd = haveData; na = nextAllowedUtc; }
 
             Color borderCol = sl ? C_WARN : C_LINE;
             using (var pen = new Pen(borderCol)) g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
@@ -958,7 +969,7 @@ namespace ClaudeUsageWidget
             bool isSmall = (currentMode == DisplayMode.Small) || (currentMode == DisplayMode.Auto && !isHovered);
             if (isSmall)
             {
-                DrawSmallPanel(g, hd, st, f, s);
+                DrawSmallPanel(g, hd, st, RetryTxt(na, true), f, s);
                 return;
             }
 
@@ -979,6 +990,8 @@ namespace ClaudeUsageWidget
                 {
                     using (var bw = new SolidBrush(C_WARN))
                         g.DrawString(st, fLabel, bw, 14, 70);
+                    string rt0 = RetryTxt(na, false);
+                    if (rt0 != "") g.DrawString(rt0, fTiny, bSub, 14, 90);
                     return;
                 }
 
@@ -986,8 +999,11 @@ namespace ClaudeUsageWidget
                 DrawRow(g, 100, "7D 每週", s, bTxt, bSub, fLabel, fBig, fTiny);
 
                 if (sl && st != "")
+                {
+                    string rt1 = RetryTxt(na, false);
                     using (var bw = new SolidBrush(C_WARN))
-                        g.DrawString("⚠ " + st, fTiny, bw, 14, 152);
+                        g.DrawString("⚠ " + st + (rt1 != "" ? " · " + rt1 : ""), fTiny, bw, 14, 152);
+                }
             }
         }
 
