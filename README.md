@@ -26,6 +26,7 @@
 - **接近上限通知**：5H 或 7D 用量首次超過 90% 時，跳一次 Windows 系統匣通知提醒。
 - **防限流指數退避**：當 API 被限流 (429) 時，會自動進行指數退避 (Exponential Backoff)，避免持續頻繁呼叫加劇限流。
 - **介面優化**：圓角無邊框、預設置頂、可滑鼠左鍵拖曳移動位置、滑鼠右鍵選單。
+- **一鍵開 Token 戰情室**（選用）：若本機另外安裝了 [TokenUsageInsights](https://github.com/doggy8088/TokenUsageInsights)（本機歷史用量儀表板），右鍵選單可一鍵開啟；服務沒在跑時會自動於背景拉起（無視窗），再開瀏覽器。未安裝則直接開網址，不影響其他功能。
 
 ## 前置需求
 
@@ -51,6 +52,7 @@
 - **方案顯示**：選擇大面板顯示的訂閱方案文字（自動／Pro／Max 5x／Max 20x／Team／自訂）。因為官方 API 與本機憑證都沒有可靠的真實方案來源（例如 Max 用戶的 `subscriptionType` 常被標成 `pro`），可在此手動指定正確文字。
 - **更新頻率**：背景自動更新間隔（1／5／10 分鐘）。預設 5 分鐘；1 分鐘較即時但較易觸發限流 (429)。
 - **開機時啟動**：勾選後登入時自動啟動（寫入 HKCU Run，免用 .cmd）。
+- **開 Token 戰情室**：開啟本機 [TokenUsageInsights](https://github.com/doggy8088/TokenUsageInsights) 儀表板（`http://localhost:3003`）。會先探測 port，服務沒起就自動從 `%LOCALAPPDATA%\Programs\TokenUsageInsights\` 背景拉起（`CreateNoWindow`，不會冒出 console 視窗），等它就緒後再開瀏覽器。此為選用整合：widget 看**即時配額**，戰情室看**歷史 token 分解**，兩者互補。
 - **關閉**：結束小工具程式。
 
 ### 系統匣圖示與雙擊操作

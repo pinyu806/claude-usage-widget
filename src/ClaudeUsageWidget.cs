@@ -86,6 +86,12 @@ namespace ClaudeUsageWidget
         // 開機自啟（寫 HKCU Run；選單版，取代外部 .cmd）
         const string RUN_KEY = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
         const string RUN_NAME = "ClaudeUsageWidget";
+
+        // Token 戰情室（TokenUsageInsights）本機服務：widget 只負責「沒起就起、起了就開」
+        const string INSIGHTS_URL = "http://localhost:3003";
+        const int INSIGHTS_PORT = 3003;
+        const string INSIGHTS_DIR = "Programs\\TokenUsageInsights";
+        const string INSIGHTS_EXE = "token-usage-insights.exe";
         // 穩定時實際每 5 分鐘打一次；失敗/尚無資料時靠 30s 心跳快速重試（受 429 退避保護），避免首筆資料等太久
 
         // 保護「顯示用」共享狀態（背景緒寫、UI 緒讀）＋ fetch reentrancy
@@ -205,6 +211,7 @@ namespace ClaudeUsageWidget
             menu.Items.Add(mPlan);
             menu.Items.Add(mInterval);
             menu.Items.Add(mAutoStart);
+            menu.Items.Add("開 Token 戰情室", null, (s, e) => OpenInsights());
             menu.Items.Add("-");
             menu.Items.Add("關閉", null, (s, e) => Close());
             ContextMenuStrip = menu;
@@ -704,6 +711,75 @@ namespace ClaudeUsageWidget
         {
             try { System.Diagnostics.Process.Start("https://claude.ai/settings/usage"); }
             catch { }
+        }
+
+        // 探測→（必要時）拉起→開瀏覽器。整段走背景緒，避免等待 port 阻塞 UI
+        void OpenInsights()
+        {
+            var t = new Thread(OpenInsightsWorker); t.IsBackground = true; t.Start();
+        }
+
+        void OpenInsightsWorker()
+        {
+            try
+            {
+                if (!InsightsAlive())
+                {
+                    string exe = InsightsExePath();
+                    if (exe != null)
+                    {
+                        try
+                        {
+                            // CUI 程式：UseShellExecute=false + CreateNoWindow 才不會冒出 console 視窗
+                            var psi = new System.Diagnostics.ProcessStartInfo(exe);
+                            psi.UseShellExecute = false;
+                            psi.CreateNoWindow = true;
+                            psi.WorkingDirectory = Path.GetDirectoryName(exe);
+                            System.Diagnostics.Process.Start(psi);
+                        }
+                        catch { }
+                        // 等它 bind port，最多 5 秒；逾時仍照開（讓瀏覽器自己報錯，不吞掉使用者的點擊）
+                        for (int i = 0; i < 10 && !InsightsAlive(); i++) Thread.Sleep(500);
+                    }
+                }
+                System.Diagnostics.Process.Start(INSIGHTS_URL);
+            }
+            catch { }
+        }
+
+        static bool InsightsAlive()
+        {
+            try
+            {
+                using (var c = new System.Net.Sockets.TcpClient())
+                {
+                    IAsyncResult ar = c.BeginConnect("127.0.0.1", INSIGHTS_PORT, null, null);
+                    if (!ar.AsyncWaitHandle.WaitOne(300)) return false;
+                    c.EndConnect(ar);
+                    return c.Connected;
+                }
+            }
+            catch { return false; }
+        }
+
+        // 安裝路徑含版本號資料夾，故遞迴搜尋並取最新的一份（升版後不必改 code）
+        static string InsightsExePath()
+        {
+            try
+            {
+                string baseDir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), INSIGHTS_DIR);
+                if (!Directory.Exists(baseDir)) return null;
+                string[] hits = Directory.GetFiles(baseDir, INSIGHTS_EXE, SearchOption.AllDirectories);
+                string best = null; DateTime bestT = DateTime.MinValue;
+                foreach (string h in hits)
+                {
+                    DateTime t = File.GetLastWriteTimeUtc(h);
+                    if (t > bestT) { bestT = t; best = h; }
+                }
+                return best;
+            }
+            catch { return null; }
         }
 
         void ShowAtDefault()
