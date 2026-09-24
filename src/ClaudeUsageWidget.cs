@@ -300,12 +300,12 @@ namespace ClaudeUsageWidget
             try
             {
                 DateTime now = DateTime.UtcNow;
-                // 429 退避：冷卻期內不打 usage（仍重繪倒數）
-                if (haveData && now < nextAllowedUtc) { Invoke2(); return; }
+                // 429 退避：冷卻期內不打 usage（仍重繪倒數）。尚無資料時也要守，否則首次即 429 會每次心跳重打、把限流越養越熱
+                if (now < nextAllowedUtc) { Invoke2(); return; }
                 // 成功後更新窗：自動觸發時距上次成功不到 refreshSec 則沿用快取（手動刷新略過此窗）
                 if (!manual && haveData && (now - lastOkUtc).TotalSeconds < refreshSec && !stale && backoffSec == 0) { Invoke2(); return; }
                 // 最短重試間隔（防養熱）：任何觸發都守
-                if (haveData && (now - lastTryUtc).TotalSeconds < minRetrySec) { Invoke2(); return; }
+                if ((now - lastTryUtc).TotalSeconds < minRetrySec) { Invoke2(); return; }
                 lastTryUtc = now;
                 try
                 {
