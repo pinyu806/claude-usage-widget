@@ -72,6 +72,11 @@ namespace ClaudeUsageWidget
         readonly string credPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude\\.credentials.json");
 
+        // Claude Code statusLine（statusline-usage.ps1）寫的用量快取：夠新就直接用，不打 usage API
+        readonly string cachePath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude\\.usage_cache.json");
+        const int cacheMaxAgeSec = 600;
+
         // Claude Code 公開 OAuth client_id + token 端點（refresh 用）
         const string CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
         const string TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
@@ -103,6 +108,7 @@ namespace ClaudeUsageWidget
         string sub = "";
         string status = "載入中…";
         bool stale = false;
+        string source = "";   // 資料來源：CC＝Claude Code statusLine 快取、API＝直接查 usage 端點
         DateTime lastTryUtc = DateTime.MinValue;
         DateTime lastOkUtc = DateTime.MinValue;
         bool haveData = false;
@@ -300,6 +306,8 @@ namespace ClaudeUsageWidget
             try
             {
                 DateTime now = DateTime.UtcNow;
+                // 優先用 statusLine 快取（不打 API、不受 429 影響）；過舊或不存在才往下走 API
+                if (TryCache()) { Invoke2(); return; }
                 // 429 退避：冷卻期內不打 usage（仍重繪倒數）。尚無資料時也要守，否則首次即 429 會每次心跳重打、把限流越養越熱
                 if (now < nextAllowedUtc) { Invoke2(); return; }
                 // 成功後更新窗：自動觸發時距上次成功不到 refreshSec 則沿用快取（手動刷新略過此窗）
@@ -337,7 +345,7 @@ namespace ClaudeUsageWidget
                     lock (stateLock)
                     {
                         five = f; seven = s; sub = subType == null ? "" : subType;
-                        haveData = true; stale = false; status = "";
+                        haveData = true; stale = false; status = ""; source = "API";
                         backoffSec = 0; nextAllowedUtc = DateTime.MinValue;
                     }
                     lastOkUtc = DateTime.UtcNow;
@@ -364,7 +372,7 @@ namespace ClaudeUsageWidget
                                     lock (stateLock)
                                     {
                                         five = f; seven = s;
-                                        haveData = true; stale = false; status = "";
+                                        haveData = true; stale = false; status = ""; source = "API";
                                         backoffSec = 0; nextAllowedUtc = DateTime.MinValue;
                                     }
                                     lastOkUtc = DateTime.UtcNow;
@@ -384,6 +392,55 @@ namespace ClaudeUsageWidget
             {
                 lock (stateLock) { fetching = false; }
             }
+        }
+
+        // 讀 statusLine 快取；updatedAt 在 cacheMaxAgeSec 內才採用（Claude Code 閒置時自然過期、退回 API）
+        bool TryCache()
+        {
+            try
+            {
+                if (!File.Exists(cachePath)) return false;
+                object root = ParseJson(File.ReadAllText(cachePath));
+                long upd = Convert.ToInt64(GetVal(root, "updatedAt"), CultureInfo.InvariantCulture);
+                long ageMs = (long)(DateTime.UtcNow - Epoch).TotalMilliseconds - upd;
+                if (ageMs > cacheMaxAgeSec * 1000L || ageMs < -60000) return false;
+                object rl = GetVal(root, "rate_limits");
+                Stat f = ParseCacheStat(rl, "five_hour");
+                Stat s = ParseCacheStat(rl, "seven_day");
+                if (!f.Found && !s.Found) return false;
+                string subType = GetStr(GetVal(SafeParse(credPath), "claudeAiOauth"), "subscriptionType");
+                lock (stateLock)
+                {
+                    five = f; seven = s; sub = subType == null ? "" : subType;
+                    haveData = true; stale = false; status = ""; source = "CC";
+                }
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // statusLine 格式：used_percentage（0–100）、resets_at（Unix 秒）
+        static Stat ParseCacheStat(object rl, string key)
+        {
+            var st = new Stat();
+            object seg = GetVal(rl, key);
+            if (seg == null) return st;
+            object u = GetVal(seg, "used_percentage");
+            if (u == null) return st;
+            st.Found = true;
+            try { st.Util = Convert.ToDouble(u, CultureInfo.InvariantCulture); } catch { }
+            object ra = GetVal(seg, "resets_at");
+            if (ra != null)
+            {
+                try
+                {
+                    DateTime r = Epoch.AddSeconds(Convert.ToDouble(ra, CultureInfo.InvariantCulture));
+                    st.RemainMin = Math.Max(0, (int)Math.Round((r - DateTime.UtcNow).TotalMinutes));
+                    st.Reset = r.ToLocalTime().ToString("MM/dd HH:mm");
+                }
+                catch { }
+            }
+            return st;
         }
 
         string GetUsage(string tok)
@@ -960,8 +1017,8 @@ namespace ClaudeUsageWidget
             g.Clear(C_BG);
 
             // snapshot 共享狀態，避免與背景 fetch 緒 torn read
-            Stat f, s; string st, sb2; bool sl, hd; DateTime na;
-            lock (stateLock) { f = five; s = seven; st = status; sb2 = sub; sl = stale; hd = haveData; na = nextAllowedUtc; }
+            Stat f, s; string st, sb2, src; bool sl, hd; DateTime na;
+            lock (stateLock) { f = five; s = seven; st = status; sb2 = sub; sl = stale; hd = haveData; na = nextAllowedUtc; src = source; }
 
             Color borderCol = sl ? C_WARN : C_LINE;
             using (var pen = new Pen(borderCol)) g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
@@ -978,7 +1035,7 @@ namespace ClaudeUsageWidget
             {
                 // header
                 g.DrawString("CLAUDE 用量", fHead, bTxt, 14, 10);
-                string hr = sl ? "⏳ 快取" : (hd ? DateTime.Now.ToString("HH:mm:ss") : "");
+                string hr = sl ? "⏳ 快取" : (hd ? src + " " + DateTime.Now.ToString("HH:mm:ss") : "");
                 var hrSz = g.MeasureString(hr, fSub);
                 using (var bHr = new SolidBrush(sl ? C_WARN : C_SUB))
                     g.DrawString(hr, fSub, bHr, Width - 14 - hrSz.Width, 12);

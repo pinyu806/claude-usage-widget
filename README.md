@@ -26,6 +26,7 @@
 - **接近上限通知**：5H 或 7D 用量首次超過 90% 時，跳一次 Windows 系統匣通知提醒。
 - **防限流指數退避**：當 API 被限流 (429) 時，會自動進行指數退避 (Exponential Backoff)，避免持續頻繁呼叫加劇限流。
 - **介面優化**：圓角無邊框、預設置頂、可滑鼠左鍵拖曳移動位置、滑鼠右鍵選單。
+- **免 API 資料源（選用，建議）**：搭配 `statusline-usage.ps1` 設成 Claude Code 的 statusLine，Claude Code 每次更新狀態列就把官方提供的用量寫進本機快取，widget 優先讀它——**不呼叫 usage 端點、不會被限流**。快取超過 10 分鐘（Claude Code 閒置）才退回 API。大面板右上角標示資料來源：`CC`＝快取、`API`＝直接查詢。設定見下方「搭配 Claude Code 狀態列」。
 - **一鍵開 Token 戰情室**（選用）：若本機另外安裝了 [TokenUsageInsights](https://github.com/doggy8088/TokenUsageInsights)（本機歷史用量儀表板），右鍵選單可一鍵開啟；服務沒在跑時會自動於背景拉起（無視窗），再開瀏覽器。未安裝則直接開網址，不影響其他功能。
 
 ## 前置需求
@@ -73,11 +74,27 @@
 - **推薦：右鍵選單**「開機時啟動」勾選即可（寫入登錄，免額外檔案）。
 - 或：雙擊 `安裝開機自啟.cmd` 建立啟動捷徑、`移除開機自啟.cmd` 移除（指向同資料夾的 `ClaudeUsageWidget.exe`）。
 
+## 搭配 Claude Code 狀態列（建議）
+
+`/api/oauth/usage` 限流很嚴，而且額度可能與其他用戶端共用；重度使用時 widget 常搶不到。Claude Code 本身在 statusLine 的輸入 JSON 裡就提供 `rate_limits.five_hour` / `seven_day` 的 `used_percentage` 與 `resets_at`（[官方文件](https://code.claude.com/docs/en/statusline)），`statusline-usage.ps1` 把它寫到 `~/.claude/.usage_cache.json` 給 widget 讀。
+
+在 `~/.claude/settings.json` 加入（路徑換成你放腳本的位置）：
+
+```json
+"statusLine": {
+  "type": "command",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"C:/path/to/statusline-usage.ps1\""
+}
+```
+
+- 狀態列會顯示 `5H 42% | 7D 10%`。
+- 限制：只有**訂閱帳號**、且該 session **收到第一次回應後**才有資料；**只有 CLI 會執行 statusLine**（Claude Desktop 的 Code 分頁不會）。沒有新鮮快取時 widget 自動退回 API，行為與舊版相同。
+
 ## 顯示說明（大面板）
 
 | 區塊 | 說明 |
 |------|------|
-| 標題列右側 | 最後更新時間；若顯示「⏳ 快取」表示當前連線失敗，正顯示上一次成功取得的資料 |
+| 標題列右側 | 資料來源（`CC`＝Claude Code 狀態列快取／`API`＝直接查詢）＋時間；若顯示「⏳ 快取」表示當前連線失敗，正顯示上一次成功取得的資料 |
 | 訂閱類型 | 顯示當前帳號類型（例如 PRO） |
 | 5H 視窗 | 5 小時滾動視窗使用率百分比、視覺化進度條、重置倒數與具體重置時間點 |
 | 7D 每週 | 7 天每週使用率百分比、視覺化進度條、重置倒數與具體重置時間點 |
